@@ -312,18 +312,16 @@ async def on_startup(bot: Bot):
     
 async def health(request):
     return web.Response(text="OK")
-        
+
 def main():
-    # Получаем порт от Render (обязательно!)
     port = int(os.environ.get('PORT', 8080))
-    
     app = web.Application()
     webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_requests_handler.register(app, path="/webhook")
     setup_application(app, dp, bot=bot)
-
-     app.router.add_get('/', health)
-    # Запускаем aiohttp сервер
+    
+    app.router.add_get('/', health)   # убрать лишний пробел
+    
     web.run_app(app, host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
