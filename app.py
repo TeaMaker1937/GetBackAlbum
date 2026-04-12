@@ -312,9 +312,6 @@ async def on_startup(bot: Bot):
     
 async def health(request):
     return web.Response(text="OK")
-
-async def health(request):
-    return web.Response(text="OK")
         
 def main():
     # Получаем порт от Render (обязательно!)
