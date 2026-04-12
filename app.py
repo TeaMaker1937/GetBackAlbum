@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Получаем токен из переменных окружения
 # Платформа FPS.ms автоматически подхватит переменную BOT_TOKEN, если вы добавите её через панель управления
-BOT_TOKEN = "8486172721:AAFuVhUdIeNY1z2wSqchJguA9lhuuFmJ3OU"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в переменных окружения. Пожалуйста, добавьте его в настройках сервера на FPS.ms")
