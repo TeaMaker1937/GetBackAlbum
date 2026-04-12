@@ -309,7 +309,13 @@ async def on_startup(bot: Bot):
     webhook_url = f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/webhook"
     await bot.set_webhook(webhook_url)
     logger.info(f"Webhook set to {webhook_url}")
+    
+async def health(request):
+    return web.Response(text="OK")
 
+async def health(request):
+    return web.Response(text="OK")
+        
 def main():
     # Получаем порт от Render (обязательно!)
     port = int(os.environ.get('PORT', 8080))
@@ -318,7 +324,8 @@ def main():
     webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_requests_handler.register(app, path="/webhook")
     setup_application(app, dp, bot=bot)
-    
+
+     app.router.add_get('/', health)
     # Запускаем aiohttp сервер
     web.run_app(app, host='0.0.0.0', port=port)
 
