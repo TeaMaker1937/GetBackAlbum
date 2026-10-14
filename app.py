@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from collections import defaultdict, deque
-from typing import Optional
+from typing import Optional, Union
 import time
 
 from aiohttp import web
@@ -12,8 +12,15 @@ from aiogram.types import (
     ContentType,
     InputMediaPhoto,
     InputMediaVideo,
-    MediaUnion,
 )
+
+try:
+    # Алиас есть в новых версиях aiogram
+    from aiogram.types import MediaUnion
+except ImportError:
+    # В aiogram 3.17 и старше его ещё нет — собираем сами
+    MediaUnion = Union[InputMediaPhoto, InputMediaVideo]
+    
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
