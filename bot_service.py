@@ -6,9 +6,10 @@ import socket
 import os
 import sys
 import asyncio
+from typing import Optional
 
-# Добавляем путь к проекту в sys.path
 sys.path.append(r'D:\Users\andre\Desktop\МАКСИМ\NOT GAMES\getBackAlbum')
+
 
 class TelegramBotService(win32serviceutil.ServiceFramework):
     _svc_name_ = "TelegramGetBackAlbumBot"
@@ -18,13 +19,22 @@ class TelegramBotService(win32serviceutil.ServiceFramework):
     def __init__(self, args):
         win32serviceutil.ServiceFramework.__init__(self, args)
         self.hWaitStop = win32event.CreateEvent(None, 0, 0, None)
+        self.bot_loop: Optional[asyncio.AbstractEventLoop] = None
         socket.setdefaulttimeout(60)
 
     def SvcStop(self):
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
         win32event.SetEvent(self.hWaitStop)
-        if hasattr(self, 'bot_task'):
-            self.bot_task.cancel()
+        loop = self.bot_loop
+        if loop and loop.is_running():
+            try:
+                # Мягкая остановка: aiogram корректно завершит start_polling
+                from bot import dp
+                asyncio.run_coroutine_threadsafe(dp.stop_polling(), loop)
+            except Exception:
+                # Fallback: грубая остановка loop (SvcStop работает из другого потока,
+                # поэтому только call_soon_threadsafe)
+                loop.call_soon_threadsafe(loop.stop)
 
     def SvcDoRun(self):
         servicemanager.LogMsg(servicemanager.EVENTLOG_INFORMATION_TYPE,
@@ -37,13 +47,21 @@ class TelegramBotService(win32serviceutil.ServiceFramework):
         await main()
 
     def main(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.bot_loop = loop
         try:
-            # Запускаем бота в event loop
-            self.bot_task = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.bot_task)
-            self.bot_task.run_until_complete(self.run_bot())
+            loop.run_until_complete(self.run_bot())
+        except (RuntimeError, asyncio.CancelledError):
+            pass  # штатная остановка службы
         except Exception as e:
-            servicemanager.LogErrorMsg(f"Ошибка в службе: {str(e)}")
+            servicemanager.LogErrorMsg(f"Ошибка в службе: {e}")
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
 
 if __name__ == '__main__':
     if len(sys.argv) == 1:
