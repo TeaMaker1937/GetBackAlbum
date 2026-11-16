@@ -12,6 +12,7 @@ from aiogram.types import (
     ContentType,
     InputMediaPhoto,
     InputMediaVideo,
+    InputMediaDocument,
 )
 
 try:
@@ -19,8 +20,8 @@ try:
     from aiogram.types import MediaUnion
 except ImportError:
     # В aiogram 3.17 и старше его ещё нет — собираем сами
-    MediaUnion = Union[InputMediaPhoto, InputMediaVideo]
-    
+    MediaUnion = Union[InputMediaPhoto, InputMediaVideo, InputMediaDocument]
+
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
@@ -45,21 +46,26 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
+# Хранилище для медиафайлов пользователей
 user_media = defaultdict(deque)
-user_last_activity = defaultdict(float)
 processing_active = defaultdict(bool)
-user_last_sent = defaultdict(float)
+user_last_sent = defaultdict(float)   # Время последней отправки
+paused = defaultdict(bool)            # /pause — не отправлять ничего до /flush
+flushing = defaultdict(bool)          # выполняется ли сейчас /flush
+tail_draining = defaultdict(bool)     # таймер хвоста сейчас выгружает остаток
+tail_timers = {}                      # user_id -> asyncio.Task таймера хвоста
+tail_deadline = defaultdict(float)    # когда хвост уйдёт (для /status)
 
+# Глобальные настройки (соблюдаем лимиты Telegram)
 BATCH_SIZE = 10
 MIN_SEND_INTERVAL = 3.0
 MAX_QUEUE_SIZE = 1000
 FLOOD_RETRY_DELAY = 15
-IDLE_TIMEOUT = 10
-MAX_ATTEMPTS = 5
+TAIL_TIMEOUT = 60      # Задача 1: через 60 сек тишины остаток уходит как есть
+MAX_ATTEMPTS = 5       # неудачных отправок подряд, после которых останавливаемся
 
-processing_tasks = {}
-background_tasks = set()
-flushing = defaultdict(bool)
+processing_tasks = {}     # user_id -> asyncio.Task автообработки
+background_tasks = set()  # держим ссылки на таски, чтобы их не собрал GC
 
 
 def uid(message: Message) -> Optional[int]:
@@ -67,11 +73,86 @@ def uid(message: Message) -> Optional[int]:
     return message.from_user.id if message.from_user else None
 
 
+# ---------------- Задача 1: таймер остатка ----------------
+
+def schedule_tail_send(user_id: int):
+    """(Пере)заряжает таймер: через TAIL_TIMEOUT сек тишины остаток уйдёт как есть.
+    Вызывается при КАЖДОМ пополнении очереди — так таймер сбрасывается на 1 минуту."""
+    if tail_draining[user_id]:
+        # таймер уже выгружает остаток — он сам заберёт и новые файлы
+        return
+
+    old = tail_timers.get(user_id)
+    if old and not old.done():
+        old.cancel()  # сброс предыдущего таймера
+
+    tail_deadline[user_id] = time.time() + TAIL_TIMEOUT
+    task = asyncio.create_task(tail_timer(user_id))
+    tail_timers[user_id] = task
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+def cancel_tail_timer(user_id: int):
+    old = tail_timers.pop(user_id, None)
+    if old and not old.done():
+        old.cancel()
+
+
+async def tail_timer(user_id: int):
+    """Срабатывает через TAIL_TIMEOUT сек после ПОСЛЕДНЕГО пополнения
+    и выгружает остаток очереди как есть (хоть 1 файл, хоть 37)."""
+    try:
+        await asyncio.sleep(TAIL_TIMEOUT)
+    except asyncio.CancelledError:
+        return  # таймер сброшен новым пополнением
+
+    if not flushing[user_id] and not paused[user_id]:
+        tail_draining[user_id] = True
+        try:
+            # если автообработка ещё работает — ждём её, остаток заберём после
+            task = processing_tasks.get(user_id)
+            if task and not task.done():
+                try:
+                    await task
+                except Exception:
+                    pass
+
+            processing_active[user_id] = True  # занимаем очередь
+            failures = 0
+            try:
+                while (user_media[user_id] and failures < MAX_ATTEMPTS
+                       and not paused[user_id]):
+                    elapsed = time.time() - user_last_sent.get(user_id, 0)
+                    if elapsed < MIN_SEND_INTERVAL:
+                        await asyncio.sleep(MIN_SEND_INTERVAL - elapsed)
+
+                    n = min(BATCH_SIZE, len(user_media[user_id]))
+                    if await safe_send_batch(user_id, n):
+                        failures = 0
+                    else:
+                        failures += 1
+                        await asyncio.sleep(FLOOD_RETRY_DELAY)
+            finally:
+                processing_active[user_id] = False
+        finally:
+            tail_draining[user_id] = False
+
+    # если очередь всё ещё не пуста (ошибки отправки) — перезарядить таймер
+    if user_media[user_id] and not flushing[user_id] and not paused[user_id]:
+        schedule_tail_send(user_id)
+
+
+# ---------------- Команды ----------------
+
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
         "🛡️ Безопасный бот для группировки медиафайлов\n\n"
-        "📸 Отправляйте фото и видео - я соберу их в альбомы по 10 штук\n"
+        "📸 Принимаю фото и видео — в том числе присланные файлами (без сжатия)\n"
+        "📦 Полные альбомы по 10 отправляю сразу, как только они наберутся\n"
+        "⏳ Остаток (меньше 10) уходит через минуту тишины — каждое новое "
+        "файл сбрасывает этот таймер\n"
         "⚡ Автоматически соблюдаю ограничения Telegram\n\n"
         "Команды:\n"
         "/flush - принудительно отправить все файлы\n"
@@ -89,13 +170,21 @@ async def cmd_status(message: Message):
     queue_size = len(user_media[user_id])
     status = "активна" if processing_active[user_id] else "неактивна"
     time_since_last = time.time() - user_last_sent.get(user_id, 0)
-    await message.answer(
+
+    text = (
         f"📊 Статус:\n"
         f"Файлов в очереди: {queue_size}\n"
         f"Обработка: {status}\n"
         f"Прошло с последней отправки: {time_since_last:.1f} сек\n"
         f"Рекомендуемая задержка: {MIN_SEND_INTERVAL} сек"
     )
+    if paused[user_id]:
+        text += "\n⏸️ Пауза включена (/flush — возобновить)"
+    t = tail_timers.get(user_id)
+    if queue_size and t and not t.done() and not flushing[user_id]:
+        remain = max(0.0, tail_deadline[user_id] - time.time())
+        text += f"\n⏳ Остаток уйдёт через ~{remain:.0f} сек, если не присылать новые"
+    await message.answer(text)
 
 
 @router.message(Command("pause"))
@@ -103,31 +192,61 @@ async def cmd_pause(message: Message):
     user_id = uid(message)
     if user_id is None:
         return
-    if processing_active[user_id]:
-        processing_active[user_id] = False
-        await message.answer("⏸️ Обработка приостановлена. Используйте /flush для возобновления.")
-    else:
+    if paused[user_id]:
         await message.answer("⏸️ Обработка уже приостановлена")
+        return
+    paused[user_id] = True
+    processing_active[user_id] = False
+    # если таймер сейчас выгружает остаток — не рвём его посреди пачки,
+    # он остановится на следующей итерации цикла (проверка paused)
+    if not tail_draining[user_id]:
+        cancel_tail_timer(user_id)
+    await message.answer(
+        "⏸️ Пауза: автоотправка и таймер остатка остановлены. "
+        "Используйте /flush, чтобы отправить всё и возобновить."
+    )
 
 
-@router.message(F.content_type.in_({ContentType.PHOTO, ContentType.VIDEO}))
+@router.message(Command("clear"))
+async def cmd_clear(message: Message):
+    user_id = uid(message)
+    if user_id is None:
+        return
+    if not user_media[user_id]:
+        await message.answer("📭 Очередь уже пуста")
+        return
+    count = len(user_media[user_id])
+    user_media[user_id].clear()
+    processing_active[user_id] = False
+    cancel_tail_timer(user_id)
+    tail_deadline[user_id] = 0.0
+    await message.answer(f"🗑️ Очередь очищена ({count} файлов)")
+
+
+# ---------------- Приём медиа ----------------
+
+@router.message(F.content_type.in_({ContentType.PHOTO, ContentType.VIDEO, ContentType.DOCUMENT}))
 async def handle_media(message: Message):
     user_id = uid(message)
     if user_id is None:
         return
 
-    user_last_activity[user_id] = time.time()
-
     if len(user_media[user_id]) >= MAX_QUEUE_SIZE:
         await message.answer("❌ Очередь переполнена! Используйте /clear чтобы очистить")
         return
 
+    # Задача 2: обычные фото/видео + фото/видео, присланные файлами
     if message.photo:
-        file_id = message.photo[-1].file_id
-        media_type = "photo"
+        file_id, media_type = message.photo[-1].file_id, "photo"
     elif message.video:
-        file_id = message.video.file_id
-        media_type = "video"
+        file_id, media_type = message.video.file_id, "video"
+    elif message.document and message.document.mime_type:
+        mime = message.document.mime_type
+        if mime.startswith("image/") or mime.startswith("video/"):
+            # файлы вернём файлами, без сжатия
+            file_id, media_type = message.document.file_id, "document"
+        else:
+            return  # не медиа (pdf, архив и т.п.) — сообщение не трогаем
     else:
         return
 
@@ -143,8 +262,10 @@ async def handle_media(message: Message):
     except Exception as e:
         logger.warning(f"Не удалось удалить сообщение: {e}")
 
-    # Запуск автообработки — один блок, строго ПОСЛЕ добавления файла
-    # (у вас этот блок был продублирован в начале и в конце хендлера)
+    # Задача 1: каждое пополнение сбрасывает таймер остатка
+    schedule_tail_send(user_id)
+
+    # Полные альбомы уходят сразу
     if not processing_active[user_id] and len(user_media[user_id]) >= BATCH_SIZE:
         processing_active[user_id] = True
         task = asyncio.create_task(safe_process_user_media(user_id))
@@ -153,31 +274,28 @@ async def handle_media(message: Message):
         task.add_done_callback(background_tasks.discard)
 
 
+# ---------------- Отправка ----------------
+
 async def safe_process_user_media(user_id: int):
-    """Только авторежим. Хвост — после IDLE_TIMEOUT секунд тишины."""
+    """Автообработка: сразу уходят только полные альбомы по 10.
+    Остаток (хвост) отправляет tail_timer через TAIL_TIMEOUT тишины."""
     logger.info(f"▶️ Автообработка для {user_id}")
     failures = 0
     try:
-        while user_media[user_id] and processing_active[user_id]:
-            if len(user_media[user_id]) >= BATCH_SIZE:
-                elapsed = time.time() - user_last_sent.get(user_id, 0)
-                if elapsed < MIN_SEND_INTERVAL:
-                    await asyncio.sleep(MIN_SEND_INTERVAL - elapsed)
+        while (user_media[user_id] and processing_active[user_id]
+               and len(user_media[user_id]) >= BATCH_SIZE):
+            elapsed = time.time() - user_last_sent.get(user_id, 0)
+            if elapsed < MIN_SEND_INTERVAL:
+                await asyncio.sleep(MIN_SEND_INTERVAL - elapsed)
 
-                if await safe_send_batch(user_id, BATCH_SIZE):
-                    failures = 0
-                else:
-                    failures += 1
-                    if failures >= MAX_ATTEMPTS:
-                        logger.error(f"🛑 {MAX_ATTEMPTS} неудач подряд для {user_id}, стоп")
-                        break
-                    await asyncio.sleep(FLOOD_RETRY_DELAY)
-                continue
-
-            idle = time.time() - user_last_activity[user_id]
-            if idle > IDLE_TIMEOUT:
-                await safe_send_batch(user_id, len(user_media[user_id]))
-            break
+            if await safe_send_batch(user_id, BATCH_SIZE):
+                failures = 0
+            else:
+                failures += 1
+                if failures >= MAX_ATTEMPTS:
+                    logger.error(f"🛑 {MAX_ATTEMPTS} неудач подряд для {user_id}, стоп")
+                    break
+                await asyncio.sleep(FLOOD_RETRY_DELAY)
     except Exception:
         logger.exception(f"❌ Ошибка автообработки {user_id}")
     finally:
@@ -185,42 +303,80 @@ async def safe_process_user_media(user_id: int):
         logger.info(f"⏹ Автообработка {user_id} остановлена")
 
 
+def split_for_sending(items: list) -> list:
+    """Фото/видео можно смешивать в одном альбоме, документы — только с документами
+    (ограничение Telegram). Режем очередь на идущие ПОДРЯД однородные куски.
+    Кусок не бывает длиннее 10: batch_size у всех вызывающих = BATCH_SIZE."""
+    groups = []
+    current = []
+    for item in items:
+        is_doc = item["type"] == "document"
+        if current and (current[0]["type"] == "document") != is_doc:
+            groups.append(current)
+            current = []
+        current.append(item)
+    if current:
+        groups.append(current)
+    return groups
+
+
+async def send_group(user_id: int, group: list):
+    if len(group) == 1:
+        # send_media_group не принимает 1 элемент
+        item = group[0]
+        if item["type"] == "photo":
+            await bot.send_photo(user_id, item["file_id"])
+        elif item["type"] == "video":
+            await bot.send_video(user_id, item["file_id"])
+        else:
+            await bot.send_document(user_id, item["file_id"])
+        return
+
+    media_list: list[MediaUnion] = []
+    for item in group:
+        if item["type"] == "photo":
+            media_list.append(InputMediaPhoto(media=item["file_id"]))
+        elif item["type"] == "video":
+            media_list.append(InputMediaVideo(media=item["file_id"]))
+        else:
+            media_list.append(InputMediaDocument(media=item["file_id"]))
+    await bot.send_media_group(user_id, media_list)
+
+
 async def safe_send_batch(user_id: int, batch_size: int) -> bool:
     n = min(batch_size, len(user_media[user_id]))
     if n <= 0:
         return True
 
+    # забираем файлы (без await внутри — атомарно для event loop)
     batch = [user_media[user_id].popleft() for _ in range(n)]
+    not_sent = list(batch)  # что ещё не успело уйти
 
     try:
-        if n == 1:
-            # send_media_group не принимает 1 элемент
-            item = batch[0]
-            if item["type"] == "photo":
-                await bot.send_photo(user_id, item["file_id"])
-            else:
-                await bot.send_video(user_id, item["file_id"])
-        else:
-            media_list: list[MediaUnion] = [
-                InputMediaPhoto(media=i["file_id"]) if i["type"] == "photo"
-                else InputMediaVideo(media=i["file_id"])
-                for i in batch
-            ]
-            await bot.send_media_group(user_id, media_list)
+        for group in split_for_sending(not_sent):
+            # антиспам-интервал перед каждой группой
+            elapsed = time.time() - user_last_sent.get(user_id, 0)
+            if elapsed < MIN_SEND_INTERVAL:
+                await asyncio.sleep(MIN_SEND_INTERVAL - elapsed)
 
-        user_last_sent[user_id] = time.time()
+            await send_group(user_id, group)
+            user_last_sent[user_id] = time.time()
+            not_sent = not_sent[len(group):]  # группа ушла целиком
         logger.info(f"✅ Отправлено {n} файлов для {user_id}")
         return True
 
     except Exception as e:
         logger.error(f"❌ Ошибка отправки для {user_id}: {e}")
-        for item in reversed(batch):
+        # возвращаем в очередь только НЕОТПРАВЛЕННОЕ, в исходном порядке
+        for item in reversed(not_sent):
             user_media[user_id].appendleft(item)
         return False
 
 
+# ---------------- /flush ----------------
+
 async def flush_queue(user_id: int, status_msg: Message):
-    """Фоновая выгрузка всей очереди: без окна неактивности, 1 файл тоже уходит."""
+    """Фоновая выгрузка всей очереди: без ожидания таймера, 1 файл тоже уходит."""
     flushing[user_id] = True
     try:
         task = processing_tasks.get(user_id)
@@ -294,6 +450,7 @@ async def cmd_flush(message: Message):
         await message.answer("⏳ /flush уже выполняется")
         return
 
+    paused[user_id] = False  # /flush возобновляет обработку после /pause
     status_msg = await message.answer(
         f"🚀 Принудительная отправка {len(user_media[user_id])} файлов..."
     )
@@ -302,24 +459,15 @@ async def cmd_flush(message: Message):
     task.add_done_callback(background_tasks.discard)
 
 
-@router.message(Command("clear"))
-async def cmd_clear(message: Message):
-    user_id = uid(message)
-    if user_id is None:
-        return
-    if not user_media[user_id]:
-        await message.answer("📭 Очередь уже пуста")
-        return
-    count = len(user_media[user_id])
-    user_media[user_id].clear()
-    processing_active[user_id] = False
-    await message.answer(f"🗑️ Очередь очищена ({count} файлов)")
-
-
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
         "🤖 Безопасный бот для группировки медиа\n\n"
+        "Как работает:\n"
+        "1. Присылайте фото/видео (можно файлами)\n"
+        "2. Каждые набранные 10 уходят альбомом сразу\n"
+        "3. Остаток уйдёт через 1 минуту тишины (каждый новый файл "
+        "сбрасывает таймер)\n\n"
         "/start - начать работу\n"
         "/flush - отправить все файлы сейчас\n"
         "/clear - очистить очередь\n"
@@ -328,6 +476,8 @@ async def cmd_help(message: Message):
         "/help - эта справка"
     )
 
+
+# ---------------- Запуск ----------------
 
 async def on_startup(bot: Bot):
     host = os.environ["RENDER_EXTERNAL_HOSTNAME"]
@@ -345,7 +495,7 @@ async def main():
 
     if os.getenv("RENDER_EXTERNAL_HOSTNAME"):
         # --- Режим вебхука (деплой на Render) ---
-        dp.startup.register(on_startup)  # раньше on_startup нигде не регистрировался!
+        dp.startup.register(on_startup)
 
         app = web.Application()
         SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
@@ -362,7 +512,7 @@ async def main():
         finally:
             await runner.cleanup()
     else:
-        # --- Локальный режим / служба Windows: long polling ---
+        # --- Локальный режим: long polling ---
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
 
